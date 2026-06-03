@@ -736,6 +736,9 @@ pub struct ClaudeLogProcessor {
     main_model_name: Option<String>,
     main_model_context_window: u32,
     context_tokens_used: u32,
+    /// Placeholder thinking entry created from `thinking_tokens` when stream
+    /// events are unavailable; reused by the next thinking `content_block_start`.
+    thinking_tokens_entry_index: Option<usize>,
 }
 
 impl ClaudeLogProcessor {
@@ -755,7 +758,35 @@ impl ClaudeLogProcessor {
             last_assistant_message: None,
             main_model_context_window: DEFAULT_CLAUDE_CONTEXT_WINDOW,
             context_tokens_used: 0,
+            thinking_tokens_entry_index: None,
         }
+    }
+
+    fn streaming_message_has_thinking_entry(&self) -> bool {
+        self.streaming_message_id
+            .as_ref()
+            .and_then(|id| self.streaming_messages.get(id))
+            .is_some_and(|state| state.has_thinking_entry())
+    }
+
+    fn ensure_thinking_tokens_placeholder(
+        &mut self,
+        entry_index_provider: &EntryIndexProvider,
+    ) -> Option<json_patch::Patch> {
+        if self.thinking_tokens_entry_index.is_some() || self.streaming_message_has_thinking_entry()
+        {
+            return None;
+        }
+
+        let entry = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::Thinking,
+            content: String::new(),
+            metadata: None,
+        };
+        let idx = entry_index_provider.next();
+        self.thinking_tokens_entry_index = Some(idx);
+        Some(ConversationPatch::add_normalized_entry(idx, entry))
     }
 
     /// Process raw logs and convert them to normalized entries with patches
@@ -1275,6 +1306,14 @@ impl ClaudeLogProcessor {
                         }
                     }
                     Some("compact_boundary") => {}
+                    // CC progress telemetry during thinking; not user-facing content.
+                    Some("thinking_tokens") => {
+                        if let Some(patch) =
+                            self.ensure_thinking_tokens_placeholder(entry_index_provider)
+                        {
+                            patches.push(patch);
+                        }
+                    }
                     Some("task_started") => {
                         if let Some(tool_use_id) = tool_use_id
                             && !self.tool_map.contains_key(tool_use_id)
@@ -1749,7 +1788,17 @@ impl ClaudeLogProcessor {
                         .as_ref()
                         .and_then(|id| self.streaming_messages.get_mut(id))
                     {
-                        state.content_block_start(*index, content_block.clone());
+                        let reuse_entry_index = self.thinking_tokens_entry_index.take();
+                        if let Some(patch) = state.content_block_start(
+                            *index,
+                            content_block.clone(),
+                            worktree_path,
+                            entry_index_provider,
+                            &mut self.last_assistant_message,
+                            reuse_entry_index,
+                        ) {
+                            patches.push(patch);
+                        }
                     }
                 }
                 ClaudeStreamEvent::ContentBlockDelta { index, delta } => {
@@ -1785,6 +1834,7 @@ impl ClaudeLogProcessor {
                     }
                 }
                 ClaudeStreamEvent::MessageStop => {
+                    self.thinking_tokens_entry_index = None;
                     if let Some(message_id) = self.streaming_message_id.take() {
                         let _ = self.streaming_messages.remove(&message_id);
                     }
@@ -2125,10 +2175,43 @@ impl StreamingMessageState {
         }
     }
 
-    fn content_block_start(&mut self, index: usize, content_block: ClaudeContentItem) {
-        if let Some(state) = StreamingContentState::from_content_block(content_block) {
-            self.contents.insert(index, state);
+    fn content_block_start(
+        &mut self,
+        index: usize,
+        content_block: ClaudeContentItem,
+        worktree_path: &str,
+        entry_index_provider: &EntryIndexProvider,
+        last_assistant_message: &mut Option<String>,
+        reuse_entry_index: Option<usize>,
+    ) -> Option<json_patch::Patch> {
+        let state = StreamingContentState::from_content_block(content_block.clone())?;
+        self.contents.insert(index, state);
+
+        if !matches!(content_block, ClaudeContentItem::Thinking { .. }) {
+            return None;
         }
+
+        let entry_state = self.contents.get_mut(&index)?;
+        let content_item = entry_state.to_content_item();
+        let entry = ClaudeLogProcessor::content_item_to_normalized_entry(
+            &content_item,
+            &self.role,
+            worktree_path,
+            last_assistant_message,
+        )?;
+        let entry_index = reuse_entry_index.unwrap_or_else(|| entry_index_provider.next());
+        entry_state.entry_index = Some(entry_index);
+        if reuse_entry_index.is_some() {
+            Some(ConversationPatch::replace(entry_index, entry))
+        } else {
+            Some(ConversationPatch::add_normalized_entry(entry_index, entry))
+        }
+    }
+
+    fn has_thinking_entry(&self) -> bool {
+        self.contents.values().any(|state| {
+            state.kind == StreamingContentKind::Thinking && state.entry_index.is_some()
+        })
     }
 
     fn apply_content_block_delta(
@@ -2757,10 +2840,30 @@ mod tests {
     use crate::logs::utils::{EntryIndexProvider, patch::extract_normalized_entry_from_patch};
 
     fn patches_to_entries(patches: &[json_patch::Patch]) -> Vec<NormalizedEntry> {
-        patches
-            .iter()
-            .filter_map(|patch| extract_normalized_entry_from_patch(patch).map(|(_, entry)| entry))
-            .collect()
+        let mut entries: Vec<Option<NormalizedEntry>> = Vec::new();
+        for patch in patches {
+            let Some((index, entry)) = extract_normalized_entry_from_patch(patch) else {
+                continue;
+            };
+            if entries.len() <= index {
+                entries.resize(index + 1, None);
+            }
+            entries[index] = Some(entry);
+        }
+        entries.into_iter().flatten().collect()
+    }
+
+    fn normalize_helper_all_patches(
+        processor: &mut ClaudeLogProcessor,
+        jsons: &[ClaudeJson],
+        worktree: &str,
+    ) -> Vec<NormalizedEntry> {
+        let provider = EntryIndexProvider::test_new();
+        let mut patches = Vec::new();
+        for json in jsons {
+            patches.extend(processor.normalize_entries(json, worktree, &provider));
+        }
+        patches_to_entries(&patches)
     }
 
     fn normalize_helper(
@@ -2804,6 +2907,74 @@ mod tests {
             entries[0].content,
             "System initialized with model: claude-sonnet-4-20250514"
         );
+    }
+
+    #[test]
+    fn test_thinking_tokens_system_message_is_filtered() {
+        let thinking_tokens_json = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":42,"estimated_tokens_delta":1,"session_id":"abc123"}"#;
+        let parsed: ClaudeJson = serde_json::from_str(thinking_tokens_json).unwrap();
+        let entries = normalize(&parsed, "");
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].entry_type,
+            NormalizedEntryType::Thinking
+        ));
+        assert!(entries[0].content.is_empty());
+    }
+
+    #[test]
+    fn test_thinking_tokens_placeholder_is_not_duplicated() {
+        let mut processor = ClaudeLogProcessor::new();
+        let thinking_tokens_json = r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":1,"estimated_tokens_delta":1,"session_id":"abc123"}"#;
+        let parsed: ClaudeJson = serde_json::from_str(thinking_tokens_json).unwrap();
+        let first = normalize_helper(&mut processor, &parsed, "");
+        let second = normalize_helper(&mut processor, &parsed, "");
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn test_thinking_delta_updates_placeholder_entry() {
+        let events = [
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-4","content":[]}},"session_id":"abc123"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}},"session_id":"abc123"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Working"}},"session_id":"abc123"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" on it"}},"session_id":"abc123"}"#,
+        ]
+        .into_iter()
+        .map(|event| serde_json::from_str::<ClaudeJson>(event).unwrap())
+        .collect::<Vec<_>>();
+
+        let mut processor = ClaudeLogProcessor::new();
+        let entries = normalize_helper_all_patches(&mut processor, &events, "");
+
+        let thinking_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| matches!(entry.entry_type, NormalizedEntryType::Thinking))
+            .collect();
+        assert_eq!(thinking_entries.len(), 1);
+        assert_eq!(thinking_entries[0].content, "Working on it");
+    }
+
+    #[test]
+    fn test_empty_thinking_block_start_emits_placeholder_entry() {
+        let events = [
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-1","role":"assistant","model":"claude-sonnet-4","content":[]}},"session_id":"abc123"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}},"session_id":"abc123"}"#,
+        ]
+        .into_iter()
+        .map(|event| serde_json::from_str::<ClaudeJson>(event).unwrap())
+        .collect::<Vec<_>>();
+
+        let mut processor = ClaudeLogProcessor::new();
+        let entries = normalize_helper_all_patches(&mut processor, &events, "");
+
+        assert_eq!(entries.len(), 2);
+        let thinking_entry = entries
+            .iter()
+            .find(|entry| matches!(entry.entry_type, NormalizedEntryType::Thinking))
+            .expect("thinking placeholder entry");
+        assert!(thinking_entry.content.is_empty());
     }
 
     #[test]

@@ -68,7 +68,8 @@ function renderRowContent(
   entry: DisplayEntry,
   attempt: WorkspaceWithSession,
   resetAction: UseResetProcessResult,
-  repos: RepoWithTargetBranch[]
+  repos: RepoWithTargetBranch[],
+  activeThinkingPatchKey: string | null
 ): React.ReactNode {
   if (isAggregatedGroup(entry)) {
     return (
@@ -126,6 +127,10 @@ function renderRowContent(
   }
 
   if (entry.type === 'NORMALIZED_ENTRY') {
+    const isActiveThinking =
+      entry.content.entry_type.type === 'thinking' &&
+      entry.patchKey === activeThinkingPatchKey;
+
     return (
       <DisplayConversationEntry
         expansionKey={entry.patchKey}
@@ -137,6 +142,7 @@ function renderRowContent(
         workspaceWithSession={attempt}
         resetAction={resetAction}
         repos={repos}
+        isActiveThinking={isActiveThinking}
       />
     );
   }
@@ -402,6 +408,31 @@ export const ConversationList = forwardRef<
       conversationRows.some((row) => row.rowFamily === 'loading'),
     [conversationRows, hasRunningProcess]
   );
+
+  const activeThinkingPatchKey = useMemo(() => {
+    if (!hasRunningProcess) {
+      return null;
+    }
+
+    for (let index = filteredEntries.length - 1; index >= 0; index -= 1) {
+      const entry = filteredEntries[index];
+      if (entry.type !== 'NORMALIZED_ENTRY') {
+        continue;
+      }
+
+      if (entry.content.entry_type.type === 'loading') {
+        continue;
+      }
+
+      if (entry.content.entry_type.type === 'thinking') {
+        return entry.patchKey;
+      }
+
+      return null;
+    }
+
+    return null;
+  }, [filteredEntries, hasRunningProcess]);
 
   const candidateFirstUnvirtualizedRowIndex = useMemo(() => {
     const firstTailRowIndex = Math.max(
@@ -841,7 +872,13 @@ export const ConversationList = forwardRef<
                       transform: `translateY(${virtualItem.start}px)`,
                     }}
                   >
-                    {renderRowContent(row.entry, attempt, resetAction, repos)}
+                    {renderRowContent(
+                      row.entry,
+                      attempt,
+                      resetAction,
+                      repos,
+                      activeThinkingPatchKey
+                    )}
                   </div>
                 );
               })}
@@ -856,7 +893,13 @@ export const ConversationList = forwardRef<
                 data-row-index={rowIndex}
                 data-semantic-key={row.semanticKey}
               >
-                {renderRowContent(row.entry, attempt, resetAction, repos)}
+                {renderRowContent(
+                  row.entry,
+                  attempt,
+                  resetAction,
+                  repos,
+                  activeThinkingPatchKey
+                )}
               </div>
             );
           })}

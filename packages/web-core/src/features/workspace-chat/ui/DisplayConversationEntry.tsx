@@ -77,6 +77,7 @@ type Props = {
   aggregatedGroup: AggregatedPatchGroup | null;
   aggregatedDiffGroup: AggregatedDiffGroup | null;
   aggregatedThinkingGroup: AggregatedThinkingGroup | null;
+  isActiveThinking?: boolean;
 };
 
 type FileEditAction = Extract<ActionType, { action: 'file_edit' }>;
@@ -308,6 +309,7 @@ function DisplayConversationEntry(props: Props) {
     executionProcessId,
     workspaceWithSession,
     resetAction,
+    isActiveThinking = false,
   } = props;
   const sessionId = workspaceWithSession?.session?.id;
   const executorCanFork = !!(
@@ -379,10 +381,15 @@ function DisplayConversationEntry(props: Props) {
         />
       );
 
-    case 'thinking':
+    case 'thinking': {
+      if (!entry.content.trim() && !isActiveThinking) {
+        return null;
+      }
+
       return (
         <ChatThinkingMessage
           content={entry.content}
+          isActive={isActiveThinking && !entry.content.trim()}
           workspaceId={workspaceWithSession?.id}
           renderMarkdown={({ content, workspaceId, className }) => (
             <AppChatMarkdown
@@ -395,6 +402,7 @@ function DisplayConversationEntry(props: Props) {
           )}
         />
       );
+    }
 
     case 'error_message':
       return (

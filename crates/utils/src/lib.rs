@@ -26,6 +26,25 @@ pub mod version;
 /// Cache for WSL2 detection result
 static WSL2_CACHE: OnceLock<bool> = OnceLock::new();
 
+static USE_PROD_DATA: OnceLock<bool> = OnceLock::new();
+
+/// When set (`VK_USE_PROD_DATA=1`), debug builds use the same data directories as
+/// release/npx (Application Support on macOS) instead of `dev_assets/`.
+pub fn use_prod_data() -> bool {
+    *USE_PROD_DATA.get_or_init(|| env_flag("VK_USE_PROD_DATA"))
+}
+
+pub(crate) fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| parse_truthy_env_value(&value))
+        .unwrap_or(false)
+}
+
+pub(crate) fn parse_truthy_env_value(value: &str) -> bool {
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+}
+
 /// Check if running in WSL2 (cached)
 pub fn is_wsl2() -> bool {
     *WSL2_CACHE.get_or_init(|| {
@@ -49,7 +68,7 @@ pub fn is_wsl2() -> bool {
 }
 
 pub fn cache_dir() -> std::path::PathBuf {
-    let proj = if cfg!(debug_assertions) {
+    let proj = if cfg!(debug_assertions) && !use_prod_data() {
         ProjectDirs::from("ai", "bloop-dev", env!("CARGO_PKG_NAME"))
             .expect("OS didn't give us a home directory")
     } else {
@@ -99,4 +118,23 @@ pub async fn get_powershell_script()
     drop(file); // Ensure file is closed
 
     Ok(script_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_truthy_env_value;
+
+    #[test]
+    fn parse_truthy_env_value_rejects_empty_and_falsey_values() {
+        assert!(!parse_truthy_env_value(""));
+        assert!(!parse_truthy_env_value("0"));
+        assert!(!parse_truthy_env_value("false"));
+    }
+
+    #[test]
+    fn parse_truthy_env_value_accepts_common_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes "] {
+            assert!(parse_truthy_env_value(value), "expected {value} to be true");
+        }
+    }
 }

@@ -4,7 +4,7 @@ use rust_embed::RustEmbed;
 const PROJECT_ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
 pub fn asset_dir() -> std::path::PathBuf {
-    let path = if cfg!(debug_assertions) {
+    let path = if cfg!(debug_assertions) && !crate::use_prod_data() {
         std::path::PathBuf::from(PROJECT_ROOT).join("../../dev_assets")
     } else {
         prod_asset_dir_path()
