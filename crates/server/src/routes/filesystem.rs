@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     Router,
     extract::{Query, State},
@@ -71,8 +73,28 @@ pub async fn list_git_repos(
     }
 }
 
+pub async fn read_file(
+    State(_deployment): State<DeploymentImpl>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<ResponseJson<ApiResponse<String>>, ApiError> {
+    let path = params
+        .get("path")
+        .ok_or_else(|| ApiError::BadRequest("Missing 'path' query parameter".to_string()))?;
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => Ok(ResponseJson(ApiResponse::success(content))),
+        Err(e) => {
+            tracing::error!("Failed to read file '{}': {}", path, e);
+            Err(ApiError::BadRequest(format!(
+                "File not found or unreadable: {}",
+                path
+            )))
+        }
+    }
+}
+
 pub fn router() -> Router<DeploymentImpl> {
     Router::new()
         .route("/filesystem/directory", get(list_directory))
         .route("/filesystem/git-repos", get(list_git_repos))
+        .route("/filesystem/file", get(read_file))
 }
