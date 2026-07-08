@@ -311,6 +311,15 @@ pub async fn run_setup_script(
     Ok(ResponseJson(ApiResponse::success(execution_process)))
 }
 
+pub async fn get_processes(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<Vec<ExecutionProcess>>>, ApiError> {
+    let pool = &deployment.db().pool;
+    let processes = ExecutionProcess::find_by_session_id(pool, session.id, false).await?;
+    Ok(ResponseJson(ApiResponse::success(processes)))
+}
+
 pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     let session_id_router = Router::new()
         .route("/", get(get_session).put(update_session))
@@ -318,6 +327,7 @@ pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
         .route("/reset", post(reset_process))
         .route("/setup", post(run_setup_script))
         .route("/review", post(review::start_review))
+        .route("/processes", get(get_processes))
         .layer(from_fn_with_state(
             deployment.clone(),
             load_session_middleware,
