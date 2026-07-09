@@ -87,8 +87,27 @@ impl ProtocolPeer {
                                     self.handle_control_request(&client, request_id, request)
                                         .await;
                                 }
-                                Ok(CLIMessage::Result(_)) => {
-                                    break;
+                                Ok(CLIMessage::Result(ref value)) => {
+                                    // Don't break if there are running background tasks
+                                    // (e.g. subagents). They may still need to send
+                                    // ControlRequests for permission checks.
+                                    let has_running_bg = value
+                                        .get("background_tasks")
+                                        .and_then(|tasks| tasks.as_array())
+                                        .map(|tasks| {
+                                            tasks.iter().any(|t| {
+                                                t.get("status")
+                                                    .and_then(|s| s.as_str())
+                                                    == Some("running")
+                                            })
+                                        })
+                                        .unwrap_or(false);
+                                    if !has_running_bg {
+                                        break;
+                                    }
+                                    tracing::debug!(
+                                        "Result has running background tasks, continuing read loop"
+                                    );
                                 }
                                 _ => {}
                             }
