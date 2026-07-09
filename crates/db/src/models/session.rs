@@ -226,4 +226,12 @@ impl Session {
         .await?;
         Ok(())
     }
+
+    pub async fn delete(pool: &SqlitePool, id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
 }

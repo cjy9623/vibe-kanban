@@ -6,7 +6,7 @@ use axum::{
     extract::{Query, State},
     middleware::from_fn_with_state,
     response::Json as ResponseJson,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use db::models::{
     coding_agent_turn::CodingAgentTurn,
@@ -105,6 +105,15 @@ pub async fn update_session(
     Ok(ResponseJson(ApiResponse::success(updated)))
 }
 
+pub async fn delete_session(
+    Extension(session): Extension<Session>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
+    let pool = &deployment.db().pool;
+    Session::delete(pool, session.id).await?;
+    Ok(ResponseJson(ApiResponse::success(())))
+}
+
 #[derive(Debug, Deserialize, TS)]
 pub struct CreateFollowUpAttempt {
     pub prompt: String,
@@ -134,6 +143,16 @@ pub async fn follow_up(
         .ok_or(ApiError::Workspace(WorkspaceError::ValidationError(
             "Workspace not found".to_string(),
         )))?;
+
+    // Block follow-up if a coding agent is already running
+    if ExecutionProcess::has_running_coding_agent_for_session(pool, session.id)
+        .await?
+    {
+        return Err(ApiError::BadRequest(
+            "A coding agent is already running in this session. Wait for it to complete before sending a follow-up."
+                .to_string(),
+        ));
+    }
 
     tracing::info!("{:?}", workspace);
 
@@ -322,7 +341,7 @@ pub async fn get_processes(
 
 pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     let session_id_router = Router::new()
-        .route("/", get(get_session).put(update_session))
+        .route("/", get(get_session).put(update_session).delete(delete_session))
         .route("/follow-up", post(follow_up))
         .route("/reset", post(reset_process))
         .route("/setup", post(run_setup_script))
