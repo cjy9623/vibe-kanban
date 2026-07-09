@@ -348,7 +348,7 @@ pub fn spawn_stream_raw_logs_to_storage(
     })
 }
 
-async fn read_execution_logs_for_execution(
+pub async fn read_execution_logs_for_execution(
     pool: &SqlitePool,
     execution_id: Uuid,
 ) -> Result<Option<String>> {

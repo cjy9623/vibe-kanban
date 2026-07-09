@@ -145,9 +145,7 @@ pub async fn follow_up(
         )))?;
 
     // Block follow-up if a coding agent is already running
-    if ExecutionProcess::has_running_coding_agent_for_session(pool, session.id)
-        .await?
-    {
+    if ExecutionProcess::has_running_coding_agent_for_session(pool, session.id).await? {
         return Err(ApiError::BadRequest(
             "A coding agent is already running in this session. Wait for it to complete before sending a follow-up."
                 .to_string(),
@@ -341,7 +339,10 @@ pub async fn get_processes(
 
 pub fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     let session_id_router = Router::new()
-        .route("/", get(get_session).put(update_session).delete(delete_session))
+        .route(
+            "/",
+            get(get_session).put(update_session).delete(delete_session),
+        )
         .route("/follow-up", post(follow_up))
         .route("/reset", post(reset_process))
         .route("/setup", post(run_setup_script))

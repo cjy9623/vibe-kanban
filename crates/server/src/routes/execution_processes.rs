@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow;
 use axum::{
     Extension, Router,
@@ -7,14 +9,14 @@ use axum::{
     routing::{get, post},
 };
 use db::models::{
-    coding_agent_turn::CodingAgentTurn,
     execution_process::{ExecutionProcess, ExecutionProcessStatus},
     execution_process_repo_state::ExecutionProcessRepoState,
 };
 use deployment::Deployment;
 use futures_util::{StreamExt, TryStreamExt};
-use serde::Deserialize;
-use services::services::container::ContainerService;
+use serde::{Deserialize, Serialize};
+use services::services::{container::ContainerService, execution_process};
+use ts_rs::TS;
 use utils::{log_msg::LogMsg, response::ApiResponse};
 use uuid::Uuid;
 
@@ -287,16 +289,232 @@ async fn get_execution_process_repo_states(
 async fn get_execution_process_turn(
     Extension(execution_process): Extension<ExecutionProcess>,
     State(deployment): State<DeploymentImpl>,
-) -> Result<ResponseJson<ApiResponse<Option<CodingAgentTurn>>>, ApiError> {
+) -> Result<ResponseJson<ApiResponse<Option<serde_json::Value>>>, ApiError> {
     let pool = &deployment.db().pool;
-    let turn = CodingAgentTurn::find_by_execution_process_id(pool, execution_process.id).await?;
-    Ok(ResponseJson(ApiResponse::success(turn)))
+    let raw = execution_process::read_execution_logs_for_execution(pool, execution_process.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to read logs for {}: {}", execution_process.id, e);
+            None
+        })
+        .unwrap_or_default();
+
+    // Parse and filter stream_events (same logic as logs endpoint)
+    let stream_events: Vec<serde_json::Value> = raw
+        .lines()
+        .filter_map(|line| {
+            let outer: serde_json::Value = serde_json::from_str(line).ok()?;
+            let inner_str = outer.get("Stdout")?.as_str()?;
+            let inner: serde_json::Value = serde_json::from_str(inner_str).ok()?;
+            let t = inner.get("type")?.as_str()?;
+            if t == "system" && inner.get("subtype")?.as_str()? == "thinking_tokens" {
+                return None;
+            }
+            if t == "stream_event" {
+                let et = inner.get("event")?.get("type")?.as_str()?;
+                if et == "content_block_delta"
+                    && inner.get("event")?.get("delta")?.get("type")?.as_str()? == "thinking_delta"
+                {
+                    return None;
+                }
+            }
+            Some(inner)
+        })
+        .filter(|v| v.get("type").and_then(|x| x.as_str()) == Some("stream_event"))
+        .collect();
+
+    let messages = aggregate_stream_events(&stream_events);
+    let last = messages.into_iter().last();
+
+    Ok(ResponseJson(ApiResponse::success(last)))
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    page: Option<u64>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, TS)]
+struct LogsResponse {
+    messages: Vec<serde_json::Value>,
+    total: u64,
+    page: u64,
+    limit: u64,
+}
+
+/// Aggregate CC stream_event deltas into coherent structured messages.
+fn aggregate_stream_events(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    // Current content blocks being built: (block_index -> "tool_use" | "text", accumulated_text)
+    let mut blocks: HashMap<i64, (String, String)> = HashMap::new();
+    let mut current_role: Option<String> = None;
+
+    for event in events {
+        let evt = match event.get("event") {
+            Some(e) => e,
+            None => {
+                // Non-stream-event: pass through directly
+                messages.push(event.clone());
+                continue;
+            }
+        };
+
+        match evt.get("type").and_then(|v| v.as_str()) {
+            Some("message_start") => {
+                // Flush previous message before starting a new one
+                if !blocks.is_empty() {
+                    let msg = build_message(&mut blocks, &current_role);
+                    if !msg["content"].as_array().map_or(true, |a| a.is_empty()) {
+                        messages.push(msg);
+                    }
+                }
+                if let Some(msg) = evt.get("message") {
+                    if let Some(role) = msg.get("role").and_then(|v| v.as_str()) {
+                        current_role = Some(role.to_string());
+                    }
+                }
+            }
+            Some("content_block_start") => {
+                let idx = evt.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                if let Some(cb) = evt.get("content_block") {
+                    let block_type = cb.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+                    let text = cb.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    blocks.insert(idx, (block_type.to_string(), text.to_string()));
+                }
+            }
+            Some("content_block_delta") => {
+                let idx = evt.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                if let Some(delta) = evt.get("delta") {
+                    match delta.get("type").and_then(|v| v.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                blocks
+                                    .entry(idx)
+                                    .and_modify(|(_, acc)| acc.push_str(t))
+                                    .or_insert_with(|| ("text".to_string(), t.to_string()));
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(t) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                blocks
+                                    .entry(idx)
+                                    .and_modify(|(_, acc)| acc.push_str(t))
+                                    .or_insert_with(|| ("tool_use".to_string(), t.to_string()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("content_block_stop") | Some("message_stop") => {
+                // Nothing to do on stop — we emit at the next message_start or at end
+            }
+            _ => {}
+        }
+    }
+
+    // Emit accumulated blocks as structured messages
+    if !blocks.is_empty() {
+        let msg = build_message(&mut blocks, &current_role);
+        if !msg["content"].as_array().map_or(true, |a| a.is_empty()) {
+            messages.push(msg);
+        }
+    }
+
+    messages
+}
+
+fn build_message(
+    blocks: &mut HashMap<i64, (String, String)>,
+    current_role: &Option<String>,
+) -> serde_json::Value {
+    let mut sorted: Vec<(i64, (String, String))> = blocks.drain().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+
+    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+    for (_, (block_type, text)) in &sorted {
+        if text.is_empty() {
+            continue;
+        }
+        if block_type == "text" {
+            content_blocks.push(serde_json::json!({"type": "text", "text": text}));
+        }
+        // tool_use blocks are skipped — only text content is returned
+    }
+
+    serde_json::json!({
+        "role": current_role.as_deref().unwrap_or("assistant"),
+        "content": content_blocks
+    })
+}
+
+async fn get_execution_process_logs(
+    Extension(execution_process): Extension<ExecutionProcess>,
+    State(deployment): State<DeploymentImpl>,
+    Query(query): Query<LogsQuery>,
+) -> Result<ResponseJson<ApiResponse<LogsResponse>>, ApiError> {
+    let pool = &deployment.db().pool;
+    let raw = execution_process::read_execution_logs_for_execution(pool, execution_process.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to read logs for {}: {}", execution_process.id, e);
+            None
+        })
+        .unwrap_or_default();
+
+    // 1. Parse everything, filter noise (thinking_tokens, thinking_delta)
+    let parsed: Vec<serde_json::Value> = raw
+        .lines()
+        .filter_map(|line| {
+            let outer: serde_json::Value = serde_json::from_str(line).ok()?;
+            let inner_str = outer.get("Stdout")?.as_str()?;
+            let inner: serde_json::Value = serde_json::from_str(inner_str).ok()?;
+            let t = inner.get("type")?.as_str()?;
+            if t == "system" && inner.get("subtype")?.as_str()? == "thinking_tokens" {
+                return None;
+            }
+            if t == "stream_event" {
+                let et = inner.get("event")?.get("type")?.as_str()?;
+                if et == "content_block_delta"
+                    && inner.get("event")?.get("delta")?.get("type")?.as_str()? == "thinking_delta"
+                {
+                    return None;
+                }
+            }
+            Some(inner)
+        })
+        .collect();
+
+    // 2. Only show stream events (the actual content stream)
+    let stream_events: Vec<serde_json::Value> = parsed
+        .into_iter()
+        .filter(|v| v.get("type").and_then(|x| x.as_str()) == Some("stream_event"))
+        .collect();
+
+    // 3. Aggregate deltas into structured messages
+    let all_messages = aggregate_stream_events(&stream_events);
+
+    let total = all_messages.len() as u64;
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let page = query.page.unwrap_or(1).max(1);
+    let offset = ((page - 1) * limit).min(total);
+    let end = (offset + limit).min(total);
+    let messages: Vec<serde_json::Value> = all_messages[offset as usize..end as usize].to_vec();
+
+    Ok(ResponseJson(ApiResponse::success(LogsResponse {
+        messages,
+        total,
+        page,
+        limit,
+    })))
 }
 
 pub(super) fn router(deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     let workspace_id_router = Router::new()
         .route("/", get(get_execution_process_by_id))
         .route("/turn", get(get_execution_process_turn))
+        .route("/logs", get(get_execution_process_logs))
         .route("/stop", post(stop_execution_process))
         .route("/repo-states", get(get_execution_process_repo_states))
         .route("/raw-logs/ws", get(stream_raw_logs_ws))
