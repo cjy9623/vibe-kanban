@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -55,6 +56,7 @@ impl ProtocolPeer {
         let mut reader = BufReader::new(stdout);
         let mut buffer = String::new();
         let mut interrupt_sent = false;
+        let mut result_received = false;
 
         loop {
             buffer.clear();
@@ -84,32 +86,18 @@ impl ProtocolPeer {
                                     request_id,
                                     request,
                                 }) => {
+                                    result_received = false;
                                     self.handle_control_request(&client, request_id, request)
                                         .await;
                                 }
-                                Ok(CLIMessage::Result(ref value)) => {
-                                    // Don't break if there are running background tasks
-                                    // (e.g. subagents). They may still need to send
-                                    // ControlRequests for permission checks.
-                                    let has_running_bg = value
-                                        .get("background_tasks")
-                                        .and_then(|tasks| tasks.as_array())
-                                        .map(|tasks| {
-                                            tasks.iter().any(|t| {
-                                                t.get("status")
-                                                    .and_then(|s| s.as_str())
-                                                    == Some("running")
-                                            })
-                                        })
-                                        .unwrap_or(false);
-                                    if !has_running_bg {
-                                        break;
-                                    }
-                                    tracing::debug!(
-                                        "Result has running background tasks, continuing read loop"
-                                    );
+                                Ok(CLIMessage::Result(_)) => {
+                                    result_received = true;
                                 }
-                                _ => {}
+                                _ => {
+                                    // Any other message resets the idle timeout
+                                    // (subagent results, hook callbacks, etc.)
+                                    result_received = false;
+                                }
                             }
                         }
                         Err(e) => {
@@ -117,6 +105,10 @@ impl ProtocolPeer {
                             break;
                         }
                     }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(30)), if result_received => {
+                    tracing::info!("Result received, no activity for 30s, closing read loop");
+                    break;
                 }
             }
         }
